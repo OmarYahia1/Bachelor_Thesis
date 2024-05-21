@@ -1,0 +1,52 @@
+import pandas as pd
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+
+# Read data from the first CSV file
+data = pd.read_csv('DataSet.csv')
+
+# Filter out "non_motion" data
+filtered_data = data[data['Motion'] != 'non_motion']
+
+# Extract features from the filtered data
+features = filtered_data.drop(columns=['Motion', 'Centroid', 'Label'])
+
+# Apply PCA to the features from the filtered data
+pca = PCA(n_components=2)
+reduced_features = pca.fit_transform(features)
+
+# Define custom colors for the original data points
+original_colors = ['red', 'green',  'navy']  # Add or change colors as needed
+
+# Plot data points from the first CSV file with custom colors
+plt.figure(figsize=(10, 8))
+for i, label in enumerate(filtered_data['Motion'].unique()):
+    mask = filtered_data['Motion'] == label
+    plt.scatter(reduced_features[mask, 0], reduced_features[mask, 1], label=label + ' (Original)', color=original_colors[i])
+
+# Read data from the second CSV file
+predicted_data = pd.read_csv('predicted_strokes.csv')
+
+# Filter out "non_motion" data from the predicted data
+filtered_predicted_data = predicted_data[predicted_data['Motion'] != 'non_motion']
+
+# Extract features from the filtered predicted data
+predicted_features = filtered_predicted_data.drop(columns=['Motion'])
+
+# Apply PCA to the features from the filtered predicted data
+reduced_predicted_features = pca.transform(predicted_features)
+
+# Define custom colors for the predicted data points
+predicted_colors = ['cyan', 'magenta', 'yellow']  # Add or change colors as needed
+
+# Plot data points from the second CSV file with custom colors
+for i, label in enumerate(filtered_predicted_data['Motion'].unique()):
+    mask = filtered_predicted_data['Motion'] == label
+    plt.scatter(reduced_predicted_features[mask, 0], reduced_predicted_features[mask, 1], label=label + ' (Predicted)', color=predicted_colors[i])
+
+plt.title('PCA of Motion Data')
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+plt.legend()
+plt.grid(True)
+plt.show()
