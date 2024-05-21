@@ -1,0 +1,274 @@
+import asyncio
+import struct
+import winsound
+from bleak import BleakClient
+import numpy as np
+from sklearn.cluster import KMeans
+import csv
+
+DEVICE_ADDRESS = "1E:54:94:E5:F0:83"
+IMU_SERVICE_UUID = "b8b4e50d-f686-4757-918a-fcd2292782de"
+SENSOR_CHAR_UUID = "85212279-0d50-4ca0-9a7e-730bdebf8e74"
+
+forehand_count = 0
+backhand_count = 0
+overhead_count = 0
+shots = 10
+in_motion_window = False
+motion_type = None
+motion_interval_data = {}
+non_motion_interval_data = {}
+all_data = []
+
+
+def calculate_features(sensor_data_list):
+    if not sensor_data_list:
+        return None
+
+    accel_x_values = np.array([item['Accel_X'] for item in sensor_data_list])
+    accel_y_values = np.array([item['Accel_Y'] for item in sensor_data_list])
+    accel_z_values = np.array([item['Accel_Z'] for item in sensor_data_list])
+
+    gyro_x_values = np.array([item['Gyro_X'] for item in sensor_data_list])
+    gyro_y_values = np.array([item['Gyro_Y'] for item in sensor_data_list])
+    gyro_z_values = np.array([item['Gyro_Z'] for item in sensor_data_list])
+
+    # Calculate differences between consecutive values
+    accel_x_diff = np.diff(accel_x_values)
+    accel_y_diff = np.diff(accel_y_values)
+    accel_z_diff = np.diff(accel_z_values)
+    gyro_x_diff = np.diff(gyro_x_values)
+    gyro_y_diff = np.diff(gyro_y_values)
+    gyro_z_diff = np.diff(gyro_z_values)
+
+    # Calculate average of differences
+    mean_accel_x_diff = np.mean(accel_x_diff) if accel_x_diff.size else 0
+    mean_accel_y_diff = np.mean(accel_y_diff) if accel_y_diff.size else 0
+    mean_accel_z_diff = np.mean(accel_z_diff) if accel_z_diff.size else 0
+    mean_gyro_x_diff = np.mean(gyro_x_diff) if gyro_x_diff.size else 0
+    mean_gyro_y_diff = np.mean(gyro_y_diff) if gyro_y_diff.size else 0
+    mean_gyro_z_diff = np.mean(gyro_z_diff) if gyro_z_diff.size else 0
+
+    features = {
+        'Mean_Accel_X': np.mean(accel_x_values),
+        'Mean_Accel_Y': np.mean(accel_y_values),
+        'Mean_Accel_Z': np.mean(accel_z_values),
+
+        'Max_Accel_X': np.max(accel_x_values),
+        'Max_Accel_Y': np.max(accel_y_values),
+        'Max_Accel_Z': np.max(accel_z_values),
+
+        'Min_Accel_X': np.min(accel_x_values),
+        'Min_Accel_Y': np.min(accel_y_values),
+        'Min_Accel_Z': np.min(accel_z_values),
+
+        'Mean_Gyro_X': np.mean(gyro_x_values),
+        'Mean_Gyro_Y': np.mean(gyro_y_values),
+        'Mean_Gyro_Z': np.mean(gyro_z_values),
+
+        'Max_Gyro_X': np.max(gyro_x_values),
+        'Max_Gyro_Y': np.max(gyro_y_values),
+        'Max_Gyro_Z': np.max(gyro_z_values),
+
+        'Min_Gyro_X': np.min(gyro_x_values),
+        'Min_Gyro_Y': np.min(gyro_y_values),
+        'Min_Gyro_Z': np.min(gyro_z_values),
+
+        'Mean_Accel_X_Diff': mean_accel_x_diff,
+        'Mean_Accel_Y_Diff': mean_accel_y_diff,
+        'Mean_Accel_Z_Diff': mean_accel_z_diff,
+
+        'Mean_Gyro_X_Diff': mean_gyro_x_diff,
+        'Mean_Gyro_Y_Diff': mean_gyro_y_diff,
+        'Mean_Gyro_Z_Diff': mean_gyro_z_diff
+    }
+    new_centroid = np.array([features['Mean_Accel_X'], features['Mean_Accel_Y'], features['Mean_Accel_Z'],
+                             features['Mean_Gyro_X'], features['Mean_Gyro_Y'], features['Mean_Gyro_Z'],
+                             features['Max_Accel_X'], features['Max_Accel_Y'], features['Max_Accel_Z'],
+                             features['Max_Gyro_X'], features['Max_Gyro_Y'], features['Max_Gyro_Z'],
+                             features['Min_Accel_X'], features['Min_Accel_Y'], features['Min_Accel_Z'],
+                             features['Min_Gyro_X'], features['Min_Gyro_Y'], features['Min_Gyro_Z'],
+                             features['Mean_Accel_X_Diff'], features['Mean_Accel_Y_Diff'],
+                             features['Mean_Accel_Z_Diff'], features['Mean_Gyro_X_Diff'],
+                             features['Mean_Gyro_Y_Diff'], features['Mean_Gyro_Z_Diff']])
+    centroid = np.mean(new_centroid, axis=0)
+    features['Centroid'] = centroid
+
+    return features
+
+
+async def main():
+    global forehand_count, backhand_count, overhead_count, in_motion_window, motion_type, motion_interval_data, all_data
+
+    try:
+        async with BleakClient(DEVICE_ADDRESS) as client:
+            print(f"Connected: {client.is_connected}")
+
+            await client.start_notify(SENSOR_CHAR_UUID, on_sensor_data_changed)
+
+            await asyncio.gather(motion_indicator(), listen_for_sensor_data(client))
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    if forehand_count >= shots and backhand_count >= shots and overhead_count >= shots:
+        cluster_final_data(all_data)
+
+
+def on_sensor_data_changed(sender, data):
+    global in_motion_window, motion_type, motion_interval_data, all_data, non_motion_interval_data
+
+    try:
+        accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z = struct.unpack('ffffff', data)
+        sensor_data = {
+            'Accel_X': accel_x,
+            'Accel_Y': accel_y,
+            'Accel_Z': accel_z,
+            'Gyro_X': gyro_x,
+            'Gyro_Y': gyro_y,
+            'Gyro_Z': gyro_z
+        }
+
+        if in_motion_window:
+            if motion_type not in motion_interval_data:
+                motion_interval_data[motion_type] = []
+            motion_interval_data[motion_type].append(sensor_data)
+        else:
+            if 'non_motion' not in non_motion_interval_data:
+                non_motion_interval_data['non_motion'] = []
+            non_motion_interval_data['non_motion'].append(sensor_data)
+
+    except Exception as e:
+        print(f"Error processing sensor data: {e}")
+
+    if not in_motion_window and motion_interval_data:
+        for motion, data_list in motion_interval_data.items():
+            features = calculate_features(data_list)
+            features['Motion'] = motion
+            all_data.append(features)
+        motion_interval_data = {}
+
+    if in_motion_window and non_motion_interval_data:
+        for motion, data_list in non_motion_interval_data.items():
+            features = calculate_features(data_list)
+            features['Motion'] = motion
+            all_data.append(features)
+        non_motion_interval_data = {}
+
+
+async def motion_indicator():
+    global in_motion_window, forehand_count, backhand_count, overhead_count, motion_type
+
+    while forehand_count < shots or backhand_count < shots or overhead_count < shots:
+        winsound.Beep(2500, 100)
+        await asyncio.sleep(3)
+        in_motion_window = True
+        winsound.Beep(1000, 100)  # forehand beep
+        motion_type = "forehand"
+        await asyncio.sleep(2)
+        in_motion_window = False
+        forehand_count += 1
+
+        await asyncio.sleep(3)
+        in_motion_window = True
+        winsound.Beep(1500, 100)  # backhand beep
+        motion_type = "backhand"
+        await asyncio.sleep(2)
+        in_motion_window = False
+        backhand_count += 1
+
+        await asyncio.sleep(3)
+        in_motion_window = True
+        winsound.Beep(2000, 100)  # overhead beep
+        motion_type = "smash"
+        await asyncio.sleep(2)
+        in_motion_window = False
+        await asyncio.sleep(1)
+        overhead_count += 1
+
+
+async def listen_for_sensor_data(client):
+    global forehand_count, backhand_count, overhead_count
+
+    while client.is_connected and (forehand_count < shots or backhand_count < shots or overhead_count < shots):
+        await asyncio.sleep(1)
+
+    print("Done")
+
+
+def cluster_final_data(data):
+    motion_types = [item['Motion'] for item in data]
+
+    mean_accel_x = [item['Mean_Accel_X'] for item in data]
+    mean_accel_y = [item['Mean_Accel_Y'] for item in data]
+    mean_accel_z = [item['Mean_Accel_Z'] for item in data]
+
+    mean_gyro_x = [item['Mean_Gyro_X'] for item in data]
+    mean_gyro_y = [item['Mean_Gyro_Y'] for item in data]
+    mean_gyro_z = [item['Mean_Gyro_Z'] for item in data]
+
+    max_accel_x = [item['Max_Accel_X'] for item in data]
+    max_accel_y = [item['Max_Accel_Y'] for item in data]
+    max_accel_z = [item['Max_Accel_Z'] for item in data]
+
+    max_gyro_x = [item['Max_Gyro_X'] for item in data]
+    max_gyro_y = [item['Max_Gyro_Y'] for item in data]
+    max_gyro_z = [item['Max_Gyro_Z'] for item in data]
+
+    min_accel_x = [item['Min_Accel_X'] for item in data]
+    min_accel_y = [item['Min_Accel_Y'] for item in data]
+    min_accel_z = [item['Min_Accel_Z'] for item in data]
+
+    min_gyro_x = [item['Min_Gyro_X'] for item in data]
+    min_gyro_y = [item['Min_Gyro_Y'] for item in data]
+    min_gyro_z = [item['Min_Gyro_Z'] for item in data]
+
+    mean_accel_x_diff = [item['Mean_Accel_X_Diff'] for item in data]
+    mean_accel_y_diff = [item['Mean_Accel_Y_Diff'] for item in data]
+    mean_accel_z_diff = [item['Mean_Accel_Z_Diff'] for item in data]
+
+    mean_gyro_x_diff = [item['Mean_Gyro_X_Diff'] for item in data]
+    mean_gyro_y_diff = [item['Mean_Gyro_Y_Diff'] for item in data]
+    mean_gyro_z_diff = [item['Mean_Gyro_Z_Diff'] for item in data]
+
+    feature_matrix = np.column_stack((
+        mean_accel_x, mean_accel_y, mean_accel_z,
+        mean_gyro_x, mean_gyro_y, mean_gyro_z,
+        max_accel_x, max_accel_y, max_accel_z,
+        max_gyro_x, max_gyro_y, max_gyro_z,
+        min_accel_x, min_accel_y, min_accel_z,
+        min_gyro_x, min_gyro_y, min_gyro_z,
+        mean_accel_x_diff, mean_accel_y_diff, mean_accel_z_diff,
+        mean_gyro_x_diff, mean_gyro_y_diff, mean_gyro_z_diff
+    ))
+
+    kmeans = KMeans(n_clusters=4)
+    kmeans.fit(feature_matrix)
+    cluster_labels = kmeans.labels_
+    centroids = kmeans.cluster_centers_
+
+    print("Cluster Labels:")
+    print(cluster_labels)
+
+    with open('DataSet.csv', 'w', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        csvwriter.writerow(
+            ['Motion', 'Centroid', 'Label', 'Mean_Ax', 'Mean_Ay', 'Mean_Az',
+             'Mean_Gx', 'Mean_Gy', 'Mean_Gz', 'Max_Ax', 'Max_Ay', 'Max_Az', 'Max_Gx', 'Max_Gy', 'Max_Gz',
+             'Min_Ax', 'Min_Ay', 'Min_Az', 'Min_Gx', 'Min_Gy', 'Min_Gz',
+             'Mean_Diff_Ax', 'Mean_Diff_Ay', 'Mean_Diff_Az',
+             'Mean_Diff_Gx', 'Mean_Diff_Gy', 'Mean_Diff_Gz'])
+
+        csvwriter.writerows([(motion, centroids[label], label, mean_accel_x[i], mean_accel_y[i], mean_accel_z[i],
+                              mean_gyro_x[i], mean_gyro_y[i], mean_gyro_z[i],
+                              max_accel_x[i], max_accel_y[i], max_accel_z[i],
+                              max_gyro_x[i], max_gyro_y[i], max_gyro_z[i],
+                              min_accel_x[i], min_accel_y[i], min_accel_z[i],
+                              min_gyro_x[i], min_gyro_y[i], min_gyro_z[i],
+                              mean_accel_x_diff[i], mean_accel_y_diff[i], mean_accel_z_diff[i],
+                              mean_gyro_x_diff[i], mean_gyro_y_diff[i], mean_gyro_z_diff[i])
+                             for i, (motion, label) in enumerate(zip(motion_types, cluster_labels))])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
