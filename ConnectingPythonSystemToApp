@@ -1,0 +1,209 @@
+import asyncio
+import struct
+import numpy as np
+import csv
+from bleak import BleakClient
+import socket
+
+DEVICE_ADDRESS = "1E:54:94:E5:F0:83"
+SENSOR_CHAR_UUID = "85212279-0d50-4ca0-9a7e-730bdebf8e74"
+#TCP_SERVER_ADDRESS = "172.20.10.9"  # IP address of the Java TCP server
+TCP_SERVER_ADDRESS = "192.168.100.22"
+TCP_SERVER_PORT = 8888  # Port used by the Java TCP server
+
+motion_interval_data = []
+
+
+def calculate_features(sensor_data_list):
+    if not sensor_data_list:
+        return None
+
+    accel_x_values = np.array([item['Accel_X'] for item in sensor_data_list])
+    accel_y_values = np.array([item['Accel_Y'] for item in sensor_data_list])
+    accel_z_values = np.array([item['Accel_Z'] for item in sensor_data_list])
+    gyro_x_values = np.array([item['Gyro_X'] for item in sensor_data_list])
+    gyro_y_values = np.array([item['Gyro_Y'] for item in sensor_data_list])
+    gyro_z_values = np.array([item['Gyro_Z'] for item in sensor_data_list])
+
+    accel_x_diff = np.diff(accel_x_values)
+    accel_y_diff = np.diff(accel_y_values)
+    accel_z_diff = np.diff(accel_z_values)
+    gyro_x_diff = np.diff(gyro_x_values)
+    gyro_y_diff = np.diff(gyro_y_values)
+    gyro_z_diff = np.diff(gyro_z_values)
+
+    mean_accel_x_diff = np.mean(accel_x_diff) if accel_x_diff.size else 0
+    mean_accel_y_diff = np.mean(accel_y_diff) if accel_y_diff.size else 0
+    mean_accel_z_diff = np.mean(accel_z_diff) if accel_z_diff.size else 0
+    mean_gyro_x_diff = np.mean(gyro_x_diff) if gyro_x_diff.size else 0
+    mean_gyro_y_diff = np.mean(gyro_y_diff) if gyro_y_diff.size else 0
+    mean_gyro_z_diff = np.mean(gyro_z_diff) if gyro_z_diff.size else 0
+
+    features = {
+        'Mean_Ax': np.mean(accel_x_values) if accel_x_values.size else 0,
+        'Mean_Ay': np.mean(accel_y_values) if accel_y_values.size else 0,
+        'Mean_Az': np.mean(accel_z_values) if accel_z_values.size else 0,
+
+        'Mean_Gx': np.mean(gyro_x_values) if gyro_x_values.size else 0,
+        'Mean_Gy': np.mean(gyro_y_values) if gyro_y_values.size else 0,
+        'Mean_Gz': np.mean(gyro_z_values) if gyro_z_values.size else 0,
+
+        'Max_Ax': np.max(accel_x_values) if accel_x_values.size else 0,
+        'Max_Ay': np.max(accel_y_values) if accel_y_values.size else 0,
+        'Max_Az': np.max(accel_z_values) if accel_z_values.size else 0,
+
+        'Max_Gx': np.max(gyro_x_values) if gyro_x_values.size else 0,
+        'Max_Gy': np.max(gyro_y_values) if gyro_y_values.size else 0,
+        'Max_Gz': np.max(gyro_z_values) if gyro_z_values.size else 0,
+
+        'Min_Ax': np.min(accel_x_values) if accel_x_values.size else 0,
+        'Min_Ay': np.min(accel_y_values) if accel_y_values.size else 0,
+        'Min_Az': np.min(accel_z_values) if accel_z_values.size else 0,
+
+        'Min_Gx': np.min(gyro_x_values) if gyro_x_values.size else 0,
+        'Min_Gy': np.min(gyro_y_values) if gyro_y_values.size else 0,
+        'Min_Gz': np.min(gyro_z_values) if gyro_z_values.size else 0,
+
+        'Mean_Diff_Ax': mean_accel_x_diff,
+        'Mean_Diff_Ay': mean_accel_y_diff,
+        'Mean_Diff_Az': mean_accel_z_diff,
+
+        'Mean_Diff_Gx': mean_gyro_x_diff,
+        'Mean_Diff_Gy': mean_gyro_y_diff,
+        'Mean_Diff_Gz': mean_gyro_z_diff
+    }
+
+    return features
+
+
+def on_sensor_data_changed(sender, data):
+    global motion_interval_data
+
+    try:
+        accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z = struct.unpack('ffffff', data)
+        sensor_data = {
+            'Accel_X': accel_x,
+            'Accel_Y': accel_y,
+            'Accel_Z': accel_z,
+            'Gyro_X': gyro_x,
+            'Gyro_Y': gyro_y,
+            'Gyro_Z': gyro_z
+        }
+
+        motion_interval_data.append(sensor_data)
+
+    except Exception as e:
+        print(f"Error processing sensor data: {e}")
+
+
+def predict_stroke(new_features, centroids, motion_names):
+    new_features_array = np.array(list(new_features.values()))
+
+    rmses = []
+    for centroid in centroids:
+        centroid_array = np.array(list(centroid.values()))
+        rmse = np.sqrt(np.mean((new_features_array - centroid_array) ** 2))
+        rmses.append(rmse)
+
+    min_rmse_index = np.argmin(rmses)
+    min_rmse_value = rmses[min_rmse_index]
+
+    predicted_motion = motion_names[min_rmse_index]
+
+    return predicted_motion, min_rmse_value
+
+
+def load_centroids_and_motions(filename):
+    centroids = []
+    motion_names = []
+
+    with open(filename, 'r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            centroid_str = row['Centroid']
+            motion_name = row['Motion']
+
+            # Remove square brackets and split by spaces to get individual values
+            centroid_values = [float(val) for val in centroid_str.strip('[]').split()]
+
+            centroid = {
+                'Mean_Ax': centroid_values[0],
+                'Mean_Ay': centroid_values[1],
+                'Mean_Az': centroid_values[2],
+
+                'Mean_Gx': centroid_values[3],
+                'Mean_Gy': centroid_values[4],
+                'Mean_Gz': centroid_values[5],
+
+                'Max_Ax': centroid_values[6],
+                'Max_Ay': centroid_values[7],
+                'Max_Az': centroid_values[8],
+
+                'Max_Gx': centroid_values[9],
+                'Max_Gy': centroid_values[10],
+                'Max_Gz': centroid_values[11],
+
+                'Min_Ax': centroid_values[12],
+                'Min_Ay': centroid_values[13],
+                'Min_Az': centroid_values[14],
+
+                'Min_Gx': centroid_values[15],
+                'Min_Gy': centroid_values[16],
+                'Min_Gz': centroid_values[17],
+
+                'Mean_Diff_Ax': centroid_values[18],
+                'Mean_Diff_Ay': centroid_values[19],
+                'Mean_Diff_Az': centroid_values[20],
+
+                'Mean_Diff_Gx': centroid_values[21],
+                'Mean_Diff_Gy': centroid_values[22],
+                'Mean_Diff_Gz': centroid_values[23]
+            }
+
+            centroids.append(centroid)
+            motion_names.append(motion_name)
+
+    return centroids, motion_names
+
+
+async def main():
+    global motion_interval_data
+
+    try:
+        async with BleakClient(DEVICE_ADDRESS) as client:
+            print(f"Connected: {client.is_connected}")
+
+            await client.start_notify(SENSOR_CHAR_UUID, on_sensor_data_changed)
+
+            centroids, motion_names = load_centroids_and_motions('DataSet.csv')
+
+            # Establish TCP connection to Java server
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_client:
+                tcp_client.connect((TCP_SERVER_ADDRESS, TCP_SERVER_PORT))
+                print("Connected to TCP server")
+
+                # Run the loop until TCP client is connected
+                while tcp_client:
+                    await asyncio.sleep(2)
+
+                    features = calculate_features(motion_interval_data)
+
+                    if features:
+                        predicted_motion, min_rmse_value = predict_stroke(features, centroids, motion_names)
+                        print("Predicted Motion:", predicted_motion)
+                        print("Minimum RMSE Value:", min_rmse_value)
+
+                        # Send predicted stroke to Java server
+                        if predicted_motion != "non_motion":
+                            tcp_client.sendall((predicted_motion + "\n").encode())
+
+                    await asyncio.sleep(0.5)
+
+                    motion_interval_data = []
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
